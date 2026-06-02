@@ -72,6 +72,10 @@ impl Worker {
         self.tag(b"CFG ").and_then(|_| self.flush()).map_err(|e| e.to_string())?;
         match &self.rd_tag().map_err(|e| e.to_string())? { b"PRE " => { let n = self.rd_u32().map_err(|e| e.to_string())? as usize; self.rd_bytes(n).map_err(|e| e.to_string()) } o => Err(format!("unexpected {:?}", o)) }
     }
+    fn set_preset(&mut self, blob: &[u8]) -> Result<(), String> {
+        self.tag(b"SPRE").and_then(|_| self.u32(blob.len() as u32)).and_then(|_| self.bytes(blob)).and_then(|_| self.flush()).map_err(|e| e.to_string())?;
+        match &self.rd_tag().map_err(|e| e.to_string())? { b"OK  " => Ok(()), b"ERR " => Err(self.rd_str().unwrap_or_default()), o => Err(format!("unexpected {:?}", o)) }
+    }
     fn quit(&mut self) { let _ = self.tag(b"QUIT"); let _ = self.flush(); let _ = self.child.wait(); }
 }
 
@@ -134,6 +138,7 @@ fn engine_thread(rx: Receiver<EngineMsg>, shared: Arc<Shared>, status: Arc<Mutex
     let sr = shared.sr.load(Relaxed);
     let set = |s: String| *status.lock().unwrap() = s;
     let mut worker: Option<Worker> = None;
+    let mut cur_dll: Option<PathBuf> = None;
     while let Ok(msg) = rx.recv() {
         match msg {
             EngineMsg::Load(dll) => {
@@ -153,7 +158,10 @@ fn engine_thread(rx: Receiver<EngineMsg>, shared: Arc<Shared>, status: Arc<Mutex
                 let mut w = match Worker::spawn(worker_exe, worker_dir) { Ok(w) => w, Err(e) => { set(format!("worker spawn failed: {e}")); continue; } };
                 match w.load(&dll.to_string_lossy(), sr, 2, 0) {
                     Ok(name) => {
-                        set(format!("“{name}” — processing track …"));
+                        // lab persistence: restore this component's saved preset, if any
+                        let mut restored = "";
+                        if let Ok(blob) = std::fs::read(preset_path(&dll)) { if !blob.is_empty() && w.set_preset(&blob).is_ok() { restored = " (restored saved)"; } }
+                        set(format!("“{name}” — processing track …{restored}"));
                         let raw = shared.raw.load_full();
                         match preprocess(&mut w, &raw) {
                             Ok(proc) => {
@@ -162,6 +170,7 @@ fn engine_thread(rx: Receiver<EngineMsg>, shared: Arc<Shared>, status: Arc<Mutex
                                 shared.proc_ready.store(true, Relaxed);
                                 shared.bypass.store(false, Relaxed);
                                 set(format!("“{name}” ready — processed {delta:+.2} dB vs raw"));
+                                cur_dll = Some(dll.clone());
                                 worker = Some(w);
                             }
                             Err(e) => { set(format!("process failed: {e}")); w.quit(); }
@@ -174,10 +183,12 @@ fn engine_thread(rx: Receiver<EngineMsg>, shared: Arc<Shared>, status: Arc<Mutex
                 if let Some(w) = worker.as_mut() {
                     set("opening the plugin’s config dialog — adjust + OK …".into());
                     match w.config() {
-                        Ok(_) => {
+                        Ok(blob) => {
+                            // lab persistence: remember this component's settings across runs
+                            if let Some(d) = &cur_dll { let pf = preset_path(d); if let Some(parent) = pf.parent() { let _ = std::fs::create_dir_all(parent); } let _ = std::fs::write(&pf, &blob); }
                             let raw = shared.raw.load_full();
                             match preprocess(w, &raw) {
-                                Ok(proc) => { let delta = rms_db(&proc) - rms_db(&raw); shared.proc.store(Arc::new(proc)); shared.bypass.store(false, Relaxed); set(format!("reprocessed — {delta:+.2} dB vs raw")); }
+                                Ok(proc) => { let delta = rms_db(&proc) - rms_db(&raw); shared.proc.store(Arc::new(proc)); shared.bypass.store(false, Relaxed); set(format!("saved + reprocessed — {delta:+.2} dB vs raw")); }
                                 Err(e) => set(format!("reprocess failed: {e}")),
                             }
                         }
@@ -289,6 +300,13 @@ fn resample_stereo(src: &[f32], from: u32, to: u32) -> Vec<f32> {
 }
 
 // Copy companion DLLs (e.g. soxr64.dll) next to the worker so loaded components resolve them.
+// Lab persistence: where a component's saved preset lives — one opaque dsp_preset blob per component,
+// in presets/ (gitignored). The "real" question of where presets live in an app is the integration's job.
+fn preset_path(dll: &Path) -> PathBuf {
+    let stem = dll.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "dsp".into());
+    proto_root().join("presets").join(format!("{stem}.preset"))
+}
+
 fn stage_companions(src_dir: &Path, worker_dir: &Path) {
     if let Ok(rd) = std::fs::read_dir(src_dir) {
         for e in rd.flatten() {

@@ -2,6 +2,7 @@
 /host/build/
 /lab/target/
 /_extract/
+/presets/
 
 # user-supplied DSP components (third-party — not ours to commit; components/README.md stays tracked)
 /components/*.fb2k-component

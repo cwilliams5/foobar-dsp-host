@@ -24,6 +24,8 @@ protocol that any program can drive. A Rust + egui "lab" is included as a refere
   survives (foobar's own VST adapter uses the same out-of-process trick).
 - **x64 and x86** workers (32-bit-only components — convolvers, crossfeed, Dolby Headphone — need the
   x86 worker; a 64-bit process can't load a 32-bit DLL).
+- **Remembers settings:** a DSP's config (its `dsp_preset` blob) is saved per-component and restored on
+  the next load (the lab keeps these under `presets/`).
 
 ## Quick start
 
@@ -61,6 +63,8 @@ DSP compatibility is a spectrum. Effects that don't read track metadata — gain
 levelers, exciters, stereo tools — work with a null track handle (most DSPs). A minimal `configStore`
 stub satisfies plugins that read a stored default (e.g. resamplers, which would otherwise bail). Plugins
 that deeply inspect the *current track* via `metadb` aren't supported (that subsystem isn't stood up).
+Settings persistence covers DSPs that keep config in the preset (most, including the dialogs you'll
+use); the few that stash global state in `configStore` won't persist it (the stub is pass-through).
 Details in `docs/HOW-IT-WORKS.md`.
 
 ## Maintenance
