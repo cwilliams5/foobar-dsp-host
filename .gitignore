@@ -1,0 +1,30 @@
+# build outputs
+/host/build/
+/lab/target/
+/_extract/
+
+# user-supplied DSP components (third-party — not ours to commit; components/README.md stays tracked)
+/components/*.fb2k-component
+
+# MSVC / SDK build intermediates (the SDK source itself IS tracked)
+sdk/**/x64/
+sdk/**/Win32/
+sdk/**/ARM64/
+sdk/**/ARM64EC/
+sdk/**/Debug/
+sdk/**/Release/
+sdk/**/ipch/
+sdk/**/.vs/
+*.user
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.iobj
+*.ipdb
+*.tlog
+*.lastbuildstate
+shared.dll
+
+# lab scratch output
+out_*.wav

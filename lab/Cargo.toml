@@ -1,0 +1,17 @@
+[package]
+name = "foobar-dsp-lab"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "foobar_dsp_lab"
+path = "src/main.rs"
+
+[dependencies]
+cpal = "0.15"
+arc-swap = "1"
+eframe = "0.28"
+symphonia = { version = "0.5", features = ["mp3"] }
+
+[profile.dev]
+opt-level = 1
