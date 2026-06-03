@@ -1,6 +1,6 @@
 // foo_dsp_host — minimal x64 in-process host for foobar2000 DSP components.
 //
-// Modes (all on one component DLL at a time):
+// Single-DSP modes (one component DLL — the minimal teaching example):
 //   foo_dsp_host <dll>                          list dsp_entries + render battery (default preset)
 //   foo_dsp_host <dll> --config                 open the plugin's OWN config dialog (modal), then
 //                                               render the battery with the configured preset
@@ -10,6 +10,12 @@
 //   foo_dsp_host <dll> --entry N                pick the Nth dsp_entry (default 0)
 //   foo_dsp_host <dll> --no-render              skip the audio battery (e.g. config-only)
 //
+// Chain mode (N components in series, via the SDK's own dsp_manager — one process, one pass, f32):
+//   foo_dsp_host --chain a.dll b.dll c.dll      render the battery through the whole chain, showing
+//                                               the cumulative effect as each stage is added
+//
+// IPC worker (the reusable unit; always hosts a chain, N>=1): foo_dsp_host --worker  (see runWorker)
+//
 // Phase-0/1 spike. See ../RESEARCH.md + ../FINDINGS.md. BSD foobar2000 SDK vendored under ../sdk.
 // Per-component FFI calls are wrapped in try/catch; the .vcxproj builds with /EHa so a hard fault
 // (AV / fast-fail) in a plugin is contained + reported rather than killing the host (in-proc lab
@@ -18,6 +24,7 @@
 #include <SDK/foobar2000.h>
 #include <SDK/component.h>
 #include <SDK/dsp.h>
+#include <SDK/dsp_manager.h> // the SDK's own DSP-chain driver (set_config + run) — chain hosting
 
 #include <SDK/configStore.h> // fb2k::configStore (stubbed below)
 #include <windows.h>
@@ -26,6 +33,7 @@
 #include <cmath>
 #include <vector>
 #include <string>
+#include <map>
 #include <memory>
 #include <io.h>
 #include <fcntl.h>
@@ -185,6 +193,92 @@ void renderOne(dsp_entry::ptr entry, const dsp_preset& preset, const char* label
            label, rmsDb(in), peakDb(in), rmsDb(out), peakDb(out), in.size() / NCH, (size_t)(och ? out.size() / och : 0), osr, och);
 }
 
+// ---------------- chain hosting (dsp_manager) ----------------
+// Loading a component is additive to the host's service registry (registerList appends factories), so
+// loading TWO components leaves BOTH their dsp_entry services discoverable — which is exactly what the
+// SDK's dsp_manager needs: it instantiates each chain stage by global GUID lookup (dsp_entry::g_instantiate)
+// against that registry. So a chain is "load every member into this one process, then run dsp_manager
+// over a dsp_chain_config of their presets" — one pass, one process, f32 throughout. We cache per path so
+// a component used by several stages (or a rebuilt chain) is registered EXACTLY ONCE (a second registerList
+// of the same factory list would double its factories in the bucket).
+std::map<std::string, std::vector<dsp_entry::ptr>> g_loaded;
+const std::vector<dsp_entry::ptr>& getComponentEntries(const std::string& path) {
+    auto it = g_loaded.find(path);
+    if (it != g_loaded.end()) return it->second;
+    std::vector<dsp_entry::ptr> entries;
+    HMODULE mod = LoadLibraryExA(path.c_str(), NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (mod) {
+        auto gi = (foobar2000_client * (__cdecl*)(foobar2000_api*, HINSTANCE))GetProcAddress(mod, "foobar2000_get_interface");
+        if (gi) {
+            foobar2000_client* comp = gi(&hostApi, mod);
+            comp->set_library_path(path.c_str(), "component"); comp->services_init(true);
+            service_factory_base* head = comp->get_service_list();
+            hostApi.registerList(head);
+            // Collect THIS component's own dsp_entries (walk its module-local factory list, not the global
+            // bucket — keeps per-component entry indexing unambiguous when several components are loaded).
+            for (service_factory_base* f = head; f; f = f->__internal__next) {
+                if (f->get_class_guid() == dsp_entry::class_guid) {
+                    service_ptr_t<service_base> base; f->instance_create(base);
+                    dsp_entry::ptr e; if (base.is_valid() && base->cast(e)) entries.push_back(e);
+                }
+            }
+        }
+    }
+    auto& slot = g_loaded[path]; slot = std::move(entries); return slot;
+}
+
+// One-shot: run a signal through a whole chain config via a fresh dsp_manager (process + FLUSH-drain in
+// one call — used by the standalone --chain battery so each item starts clean).
+bool processChain(const dsp_chain_config& chain, const std::vector<float>& in,
+                  std::vector<float>& out, unsigned& outSr, unsigned& outCh) {
+    dsp_manager mgr; mgr.set_config(chain);
+    dsp_chunk_list_impl list; if (!in.empty()) list.add_item()->set_data_32(in.data(), in.size() / NCH, NCH, SR);
+    dsp_track_t nullTrack; mgr.run(&list, nullTrack, dsp::FLUSH, fb2k::noAbort);
+    out.clear(); outSr = SR; outCh = NCH;
+    for (t_size i = 0; i < list.get_count(); i++) { audio_chunk* c = list.get_item(i); outSr = c->get_srate(); outCh = c->get_channels(); const audio_sample* dd = c->get_data(); out.insert(out.end(), dd, dd + c->get_sample_count() * c->get_channels()); }
+    return true;
+}
+
+// Standalone proof: build a chain from N component DLLs and show the CUMULATIVE effect as each stage is
+// added (raw -> +stage1 -> +stage1+stage2 -> …). Demonstrates real in-process chaining via dsp_manager.
+void runChainBattery(const std::vector<std::string>& dlls) {
+    std::vector<dsp_preset_impl> presets; std::vector<std::string> names;
+    for (auto& d : dlls) {
+        const auto& es = getComponentEntries(d);
+        if (es.empty()) { printf("[host] %s: no dsp_entry (skipped)\n", d.c_str()); continue; }
+        dsp_preset_impl p; try { es[0]->get_default_preset(p); } catch (...) { p.set_owner(es[0]->get_guid()); }
+        pfc::string8 nm; es[0]->get_name(nm);
+        presets.push_back(p); names.push_back(nm.c_str());
+    }
+    if (presets.empty()) { printf("[host] no chain stages loaded\n"); return; }
+    printf("[host] chain (%zu stages):", presets.size());
+    for (size_t i = 0; i < names.size(); i++) printf(" %s\"%s\"", i ? "-> " : "", names[i].c_str());
+    printf("\n[host] cumulative RMS dBFS as each stage is added:\n");
+
+    const char* sigNames[] = { "sine1k", "sweep", "noise" };
+    std::vector<float> sigs[] = { genSine(1000.0f), genSweep(), genNoise() };
+    for (int s = 0; s < 3; s++) {
+        printf("   %-7s raw %6.2f", sigNames[s], rmsDb(sigs[s]));
+        dsp_chain_config_impl prefix;
+        for (size_t k = 0; k < presets.size(); k++) {
+            prefix.add_item(presets[k]);
+            std::vector<float> out; unsigned osr = SR, och = NCH; bool ok = false;
+            try { ok = processChain(prefix, sigs[s], out, osr, och); } catch (...) {}
+            if (ok) printf("  | +%s %6.2f", names[k].c_str(), rmsDb(out)); else printf("  | +%s FAULT", names[k].c_str());
+        }
+        printf("\n");
+    }
+    // Dump the full-chain sweep so the result is audible / inspectable.
+    std::vector<float> out; unsigned osr = SR, och = NCH; dsp_chain_config_impl full;
+    for (auto& p : presets) full.add_item(p);
+    if (processChain(full, sigs[1], out, osr, och)) {
+        writeWav16("out_chain_sweep_in.wav", sigs[1], NCH, SR);
+        writeWav16("out_chain_sweep_out.wav", out, och, osr);
+        printf("[host] wrote out_chain_sweep_{in,out}.wav (%u Hz, %u ch, %zu->%zu frames)\n",
+               osr, och, sigs[1].size() / NCH, (size_t)(och ? out.size() / och : 0));
+    }
+}
+
 LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) { return DefWindowProcW(h, m, w, l); }
 HWND createHostWindow() {
     WNDCLASSEXW wc = { sizeof(wc) }; wc.lpfnWndProc = WndProc; wc.hInstance = GetModuleHandleW(NULL);
@@ -213,10 +307,20 @@ Args parse(int argc, char** argv) {
 }
 
 // ---------------- IPC worker (framed binary stdio; stderr = diagnostics) ----------------
-// 4-byte tags, little-endian. parent->worker: LOAD<u32 len,path><srate><nch><entryIdx>,
-// SPRE<u32 len, blob=GUID16+data>, PROC<u32 nframes><f32 nframes*nch>, "CFG ", GPRE, QUIT.
-// worker->parent: "LOK "<status><u32 len,name>, "OK  ", "POK "<u32 nframes><f32...>, "PRE "<u32 len,blob>,
-// "ERR "<u32 len,msg>. Audio = interleaved f32. One persistent dsp streams across PROC calls (flags=0).
+// 4-byte tags, little-endian. The worker hosts a CHAIN of N>=1 DSPs (a single DSP is just N=1).
+// parent->worker:
+//   LOAD <u32 len,path><u32 srate><u32 nch><u32 entryIdx>            -- set chain to ONE stage (default preset)
+//   CHAN <u32 srate><u32 nch><u32 count> then count x { <u32 len,path><u32 entryIdx><u32 len,blob> }
+//                                                                    -- build an N-stage chain (blob empty = default)
+//   RST                                                              -- drop instantiated DSPs; next PROC is fresh
+//   PROC <u32 nframes><f32 nframes*nch>                              -- stream a block through the whole chain
+//   FLSH                                                             -- end-of-stream drain (each stage's tail)
+//   CFG  <u32 stage>  /  GPRE <u32 stage>  /  SPRE <u32 stage><u32 len,blob>   -- per-stage config/get/set preset
+//   QUIT
+// worker->parent: "LOK "<u32 status><u32 len,name>, "COK "<u32 count><count x str name>, "OK  ",
+//   "POK "<u32 nframes><f32...>, "PRE "<u32 len,blob=GUID16+data>, "ERR "<u32 len,msg>.
+// Audio = interleaved f32. PROC streams with flags=0 (state preserved); dsp_manager runs every stage in
+// series in one pass. blob = 16-byte owner GUID + dsp_preset data.
 bool rdN(void* p, size_t n) { return fread(p, 1, n, stdin) == n; }
 uint32_t rdU32() { uint32_t v = 0; rdN(&v, 4); return v; }
 std::string rdStr() { uint32_t n = rdU32(); std::string s(n, '\0'); if (n) rdN(&s[0], n); return s; }
@@ -233,61 +337,101 @@ int runWorker() {
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
     setvbuf(stderr, nullptr, _IONBF, 0);
-    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX); // no OS dialogs on a bad/wrong-arch/crashing plugin
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX); // no OS dialogs on a bad/crashing plugin
     foobar2000_client* self = foobar2000_get_interface(&hostApi, GetModuleHandleW(NULL));
     self->set_library_path("", "foo_dsp_host"); self->services_init(true);
     hostApi.registerList(service_factory_base::__internal__list);
     HWND wnd = createHostWindow(); hostApi.mainWnd = wnd;
     fprintf(stderr, "[worker] ready (%zu-bit)\n", sizeof(void*) * 8);
 
-    HMODULE mod = NULL; dsp_entry::ptr entry; service_ptr_t<dsp> theDsp; dsp_preset_impl preset;
+    // The worker hosts a CHAIN (N>=1 stages). dsp_manager owns the instantiated DSPs + runs them in series;
+    // we keep the chain config + the per-stage dsp_entry (for config dialogs / names). A single DSP is just
+    // a 1-stage chain — LOAD is exactly CHAN with count=1 and a default preset.
+    dsp_manager manager;
+    dsp_chain_config_impl chain;
+    std::vector<dsp_entry::ptr> stageEntry; // parallel to chain items
+    dsp_track_t nullTrack;
     unsigned srate = 44100, nch = 2; char tag[4];
+
+    // Append one stage: component DLL + which dsp_entry in it (0 = the usual single entry) + optional preset
+    // blob (GUID16 + data; empty = the entry's default). Returns false if the DLL/entry can't be resolved.
+    auto addStage = [&](const std::string& dll, uint32_t eidx, const std::string& blob) -> bool {
+        const std::vector<dsp_entry::ptr>& es = getComponentEntries(dll);
+        if (eidx >= es.size()) return false;
+        dsp_entry::ptr e = es[eidx];
+        dsp_preset_impl p;
+        if (blob.size() >= 16) { GUID g; memcpy(&g, blob.data(), 16); p.set_owner(g); p.set_data(blob.data() + 16, blob.size() - 16); }
+        else { try { e->get_default_preset(p); } catch (...) { p.set_owner(e->get_guid()); } }
+        chain.add_item(p); stageEntry.push_back(e); return true;
+    };
+    auto readChunksTo = [](dsp_chunk_list_impl& list, std::vector<float>& out) {
+        for (t_size i = 0; i < list.get_count(); i++) { audio_chunk* c = list.get_item(i); const audio_sample* d = c->get_data(); out.insert(out.end(), d, d + c->get_sample_count() * c->get_channels()); }
+    };
+
     while (rdN(tag, 4)) {
-        if (!memcmp(tag, "LOAD", 4)) {
+        if (!memcmp(tag, "LOAD", 4)) { // single-stage chain, default preset (back-compat spelling of CHAN 1)
             std::string path = rdStr(); srate = rdU32(); nch = rdU32(); uint32_t eidx = rdU32();
+            chain.remove_all(); stageEntry.clear();
             try {
-                mod = LoadLibraryExA(path.c_str(), NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
-                if (!mod) { wrErr("LoadLibrary failed"); continue; }
-                auto gi = (foobar2000_client * (__cdecl*)(foobar2000_api*, HINSTANCE))GetProcAddress(mod, "foobar2000_get_interface");
-                if (!gi) { wrErr("no foobar2000_get_interface export"); continue; }
-                foobar2000_client* comp = gi(&hostApi, mod); comp->set_library_path(path.c_str(), "component"); comp->services_init(true);
-                hostApi.registerList(comp->get_service_list());
-                Bucket* b = hostApi.find(dsp_entry::class_guid);
-                if (!b || eidx >= b->factories.size()) { wrErr("no dsp_entry"); continue; }
-                service_ptr_t<service_base> base; b->factories[eidx]->instance_create(base);
-                if (base.is_empty() || !base->cast(entry)) { wrErr("cast to dsp_entry failed"); continue; }
-                entry->get_default_preset(preset);
-                if (!entry->instantiate(theDsp, preset)) { wrErr("instantiate failed"); continue; }
-                pfc::string8 nm; entry->get_name(nm);
+                if (!addStage(path, eidx, std::string())) { wrErr("no dsp_entry / load failed"); continue; }
+                manager.set_config(chain);
+                pfc::string8 nm; stageEntry[0]->get_name(nm);
                 wrTag("LOK "); wrU32(1); wrStr(nm.c_str()); fflush(stdout);
             } catch (...) { wrErr("exception in LOAD"); }
-        } else if (!memcmp(tag, "SPRE", 4)) {
-            std::string blob = rdStr();
-            if (blob.size() >= 16) { GUID g; memcpy(&g, blob.data(), 16); preset.set_owner(g); preset.set_data(blob.data() + 16, blob.size() - 16); }
-            try { entry->instantiate(theDsp, preset); wrTag("OK  "); fflush(stdout); } catch (...) { wrErr("reinit failed"); }
-        } else if (!memcmp(tag, "PROC", 4)) {
+        } else if (!memcmp(tag, "CHAN", 4)) { // build an N-stage chain atomically in one message
+            srate = rdU32(); nch = rdU32(); uint32_t count = rdU32();
+            struct Req { std::string dll; uint32_t eidx; std::string blob; };
+            std::vector<Req> reqs(count);
+            for (uint32_t i = 0; i < count; i++) { reqs[i].dll = rdStr(); reqs[i].eidx = rdU32(); reqs[i].blob = rdStr(); }
+            chain.remove_all(); stageEntry.clear();
+            bool ok = true;
+            try { for (auto& rq : reqs) if (!addStage(rq.dll, rq.eidx, rq.blob)) { ok = false; break; } }
+            catch (...) { ok = false; }
+            if (!ok) { chain.remove_all(); stageEntry.clear(); wrErr("a chain stage failed to load"); continue; }
+            manager.set_config(chain);
+            wrTag("COK "); wrU32((uint32_t)chain.get_count());
+            for (auto& e : stageEntry) { pfc::string8 nm; e->get_name(nm); wrStr(nm.c_str()); }
+            fflush(stdout);
+        } else if (!memcmp(tag, "RST ", 4)) { // drop instantiated DSPs; next PROC re-instantiates the chain fresh
+            manager.close(); wrTag("OK  "); fflush(stdout);
+        } else if (!memcmp(tag, "PROC", 4)) { // stream a block through the WHOLE chain (one dsp_manager pass)
             uint32_t nf = rdU32(); std::vector<float> in((size_t)nf * nch); if (nf) rdN(in.data(), (size_t)nf * nch * 4);
             std::vector<float> out;
             try {
                 dsp_chunk_list_impl list; if (nf) list.add_item()->set_data_32(in.data(), nf, nch, srate);
-                dsp_track_t nullTrack; theDsp->run(&list, nullTrack, 0);
-                for (t_size i = 0; i < list.get_count(); i++) { audio_chunk* c = list.get_item(i); const audio_sample* d = c->get_data(); out.insert(out.end(), d, d + c->get_sample_count() * c->get_channels()); }
+                manager.run(&list, nullTrack, 0, fb2k::noAbort);
+                readChunksTo(list, out);
             } catch (...) { wrErr("proc fault"); continue; }
             wrTag("POK "); wrU32((uint32_t)(nch ? out.size() / nch : 0)); wrBytes(out.data(), out.size() * 4); fflush(stdout);
-        } else if (!memcmp(tag, "FLSH", 4)) {
-            // Drain the DSP's buffered tail (look-ahead levelers, reverbs, resamplers emit here). After
-            // this the dsp is spent; the next PROC pass must be preceded by a re-instantiate (SPRE/CFG/LOAD).
+        } else if (!memcmp(tag, "FLSH", 4)) { // end-of-stream drain: every stage emits its buffered tail
             std::vector<float> out;
             try {
-                dsp_chunk_list_impl list; dsp_track_t nullTrack; theDsp->run(&list, nullTrack, dsp::FLUSH);
-                for (t_size i = 0; i < list.get_count(); i++) { audio_chunk* c = list.get_item(i); const audio_sample* d = c->get_data(); out.insert(out.end(), d, d + c->get_sample_count() * c->get_channels()); }
+                dsp_chunk_list_impl list; manager.run(&list, nullTrack, dsp::FLUSH, fb2k::noAbort);
+                readChunksTo(list, out);
             } catch (...) { wrErr("flush fault"); continue; }
             wrTag("POK "); wrU32((uint32_t)(nch ? out.size() / nch : 0)); wrBytes(out.data(), out.size() * 4); fflush(stdout);
-        } else if (!memcmp(tag, "CFG ", 4)) {
-            try { if (entry.is_valid() && entry->have_config_popup()) { entry->show_config_popup(preset, wnd); entry->instantiate(theDsp, preset); } } catch (...) {}
-            wrTag("PRE "); wrStr(presetBlob(preset)); fflush(stdout);
-        } else if (!memcmp(tag, "GPRE", 4)) {
-            wrTag("PRE "); wrStr(presetBlob(preset)); fflush(stdout);
+        } else if (!memcmp(tag, "CFG ", 4)) { // open stage's OWN config dialog, apply to the chain, return its preset
+            uint32_t stage = rdU32();
+            try {
+                if (stage < chain.get_count() && stageEntry[stage].is_valid() && stageEntry[stage]->have_config_popup()) {
+                    dsp_preset_impl p(chain.get_item(stage));
+                    stageEntry[stage]->show_config_popup(p, wnd);
+                    chain.replace_item(p, stage); manager.set_config(chain);
+                    wrTag("PRE "); wrStr(presetBlob(p)); fflush(stdout);
+                } else if (stage < chain.get_count()) {
+                    wrTag("PRE "); wrStr(presetBlob(chain.get_item(stage))); fflush(stdout);
+                } else wrErr("CFG stage out of range");
+            } catch (...) { wrErr("config fault"); }
+        } else if (!memcmp(tag, "GPRE", 4)) { // get stage's current preset blob
+            uint32_t stage = rdU32();
+            if (stage < chain.get_count()) { wrTag("PRE "); wrStr(presetBlob(chain.get_item(stage))); fflush(stdout); }
+            else wrErr("GPRE stage out of range");
+        } else if (!memcmp(tag, "SPRE", 4)) { // set stage's preset (GUID16 + data); recycles the rest of the chain
+            uint32_t stage = rdU32(); std::string blob = rdStr();
+            if (stage >= chain.get_count()) { wrErr("SPRE stage out of range"); continue; }
+            dsp_preset_impl p;
+            if (blob.size() >= 16) { GUID g; memcpy(&g, blob.data(), 16); p.set_owner(g); p.set_data(blob.data() + 16, blob.size() - 16); }
+            try { chain.replace_item(p, stage); manager.set_config(chain); wrTag("OK  "); fflush(stdout); } catch (...) { wrErr("set preset failed"); }
         } else if (!memcmp(tag, "QUIT", 4)) { break; }
         else { wrErr("unknown tag"); }
     }
@@ -297,8 +441,24 @@ int runWorker() {
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     for (int i = 1; i < argc; i++) if (std::string(argv[i]) == "--worker") return runWorker();
+
+    // --chain a.dll b.dll c.dll : build a real N-stage DSP chain (via the SDK's dsp_manager) and render the
+    // battery through it, showing the cumulative effect of each added stage. The standalone proof that
+    // in-process chaining works (no .exe->.exe->.exe piping).
+    std::vector<std::string> chainDlls;
+    for (int i = 1; i < argc; i++) if (std::string(argv[i]) == "--chain") { for (int j = i + 1; j < argc && argv[j][0] != '-'; j++) chainDlls.push_back(argv[j]); }
+    if (!chainDlls.empty()) {
+        foobar2000_client* self = foobar2000_get_interface(&hostApi, GetModuleHandleW(NULL));
+        self->set_library_path("", "foo_dsp_host"); self->services_init(true);
+        hostApi.registerList(service_factory_base::__internal__list);
+        HWND wnd = createHostWindow(); hostApi.mainWnd = wnd;
+        runChainBattery(chainDlls);
+        if (wnd) DestroyWindow(wnd);
+        return 0;
+    }
+
     Args args = parse(argc, argv);
-    if (args.dll.empty()) { printf("usage: foo_dsp_host <component.dll> [--config] [--preset-in f] [--preset-out f] [--in wav] [--entry N] [--no-render] | --worker\n"); return 2; }
+    if (args.dll.empty()) { printf("usage: foo_dsp_host <component.dll> [--config] [--preset-in f] [--preset-out f] [--in wav] [--entry N] [--no-render]\n       foo_dsp_host --chain a.dll b.dll c.dll   (render a DSP chain)\n       foo_dsp_host --worker                    (IPC worker; LOAD/CHAN/PROC/...)\n"); return 2; }
 
     foobar2000_client* self = foobar2000_get_interface(&hostApi, GetModuleHandleW(NULL));
     self->set_library_path("", "foo_dsp_host"); self->services_init(true);

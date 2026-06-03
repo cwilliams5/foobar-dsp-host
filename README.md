@@ -1,8 +1,8 @@
 # foobar-dsp-host
 
-**Host real foobar2000 DSP components (`foo_dsp_*`) outside of foobar2000.** Load them, stream audio
-through them, drive their *own* config dialogs, and get processed audio back. As far as I know this is
-the first open-source host that does this generically.
+**Host real foobar2000 DSP components (`foo_dsp_*`) outside of foobar2000.** Load them, **chain several
+together**, stream audio through the chain, drive each plugin's *own* config dialog, and get processed
+audio back. As far as I know this is the first open-source host that does this generically.
 
 foobar2000's component model isn't a flat C ABI — it's a COM-like C++ **service** SDK, which is why
 hosting its DSPs outside the player has long been considered impractical. It turns out the surface a
@@ -19,6 +19,9 @@ protocol that any program can drive. A Rust + egui "lab" is included as a refere
 
 - Loads any foobar2000 **v2 (x64)** or **v1.x (x86)** DSP component.
 - Enumerates its `dsp_entry`, instantiates it, and streams **f32** audio through `dsp::run`.
+- **Chains DSPs** — load several into one worker and run them in series via the SDK's own `dsp_manager`
+  (one process, one pass, f32 throughout — not `.exe→.exe→.exe`). Reorder, remove, and configure each
+  stage individually. See `docs/HOW-IT-WORKS.md` → *Chaining*.
 - Opens the plugin's **own** Win32 config dialog and round-trips its preset blob.
 - **Isolation:** the plugin runs in a separate worker process — a crash drops the pipe and the host
   survives (foobar's own VST adapter uses the same out-of-process trick).
@@ -32,9 +35,10 @@ protocol that any program can drive. A Rust + egui "lab" is included as a refere
 1. Install **Visual Studio 2022** with the Desktop C++ workload (**x64 + x86**), and **Rust** (`cargo`).
 2. Drop one or more `.fb2k-component` files into **`components/`**.
 3. Double-click **`run-lab.bat`**.
-4. In the window: pick a DSP → **Load** → **Play** → toggle **A · Bypass / B · Processed** → **Open
-   config…**. It plays the bundled CC0 clip; drop your own `test.mp3`/`.flac`/`.wav` in the repo root to
-   use that instead.
+4. In the window: pick a DSP → **➕ Add to chain** (repeat to stack more) → reorder with **↑/↓**, drop one
+   with **✕** → **▶ Apply chain** → **▶ Play** → toggle **A · Bypass / B · Processed**, and **⚙ Config** any
+   stage to open its own dialog. It plays the bundled CC0 clip; drop your own `test.mp3`/`.flac`/`.wav` in
+   the repo root to use that instead.
 
 **No foobar2000 installation is required** — `shared.dll` builds from the bundled BSD SDK source.
 

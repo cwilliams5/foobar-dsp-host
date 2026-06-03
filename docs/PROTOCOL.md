@@ -4,13 +4,19 @@ The worker (`foo_dsp_host.exe --worker`) is the reusable unit. It speaks a tiny 
 **stdin** (parent → worker) and **stdout** (worker → parent). **stderr** is human-readable diagnostics
 only — never parse it. Any language that can spawn a process and read/write its pipes can drive it.
 
+**The worker hosts a *chain* of N ≥ 1 DSPs.** All stages are loaded into the one worker process and run in
+series, in a single pass, by the SDK's own `dsp_manager` — one host↔worker round-trip per audio block for
+the whole chain (no `.exe→.exe→.exe` piping, no per-stage re-serialization). A single DSP is just the N=1
+case (`LOAD` is exactly `CHAN` with one stage and a default preset).
+
 ## Framing
 
 - **Tags** are exactly **4 ASCII bytes** (note the trailing spaces on short tags, e.g. `"CFG "`,
-  `"OK  "`).
+  `"OK  "`, `"RST "`).
 - Integers are **little-endian `u32`**.
 - **Strings** = `u32` byte-length followed by that many **UTF-8** bytes.
 - **Audio** = interleaved **`f32`** (`L R L R …`), little-endian, `frames × channels` samples.
+- A **preset blob** = 16-byte owner GUID + the DSP's opaque `dsp_preset` data (empty data is valid).
 
 A message is a tag followed by its payload. Requests and replies are 1:1 and synchronous (send one,
 read one), except the modal `CFG ` (see below).
@@ -19,47 +25,58 @@ read one), except the modal `CFG ` (see below).
 
 | Tag | Payload | Meaning |
 |---|---|---|
-| `LOAD` | `str` dllPath · `u32` sampleRate · `u32` channels · `u32` entryIndex | Load the component DLL, find its `entryIndex`-th `dsp_entry`, instantiate it with its default preset. |
-| `SPRE` | `str` blob (16-byte owner GUID + preset bytes) | Set the preset and re-instantiate the DSP. |
-| `PROC` | `u32` frames · `f32[frames × channels]` | Process one audio block (streaming — DSP state is preserved across calls). |
-| `FLSH` | — | Drain the DSP's buffered/look-ahead tail at end-of-stream. |
-| `CFG ` | — | Open the plugin's own modal config dialog (parented to a hidden host window). Blocks until the user closes it. |
-| `GPRE` | — | Get the current preset. |
+| `CHAN` | `u32` sampleRate · `u32` channels · `u32` count, then `count`×{ `str` dllPath · `u32` entryIndex · `str` presetBlob } | Build an N-stage chain. Each stage loads its component, picks its `entryIndex`-th `dsp_entry`, and uses the given preset (empty blob = the entry's default). Replaces any current chain. |
+| `LOAD` | `str` dllPath · `u32` sampleRate · `u32` channels · `u32` entryIndex | Convenience: set the chain to a **single** stage with its default preset (≡ `CHAN` count=1). |
+| `RST ` | — | Drop the instantiated DSPs; the next `PROC` re-instantiates the whole chain fresh (use before re-processing a track after a config/seek). The chain config is kept. |
+| `PROC` | `u32` frames · `f32[frames × channels]` | Stream one audio block through the **whole chain** (state preserved across calls). |
+| `FLSH` | — | End-of-stream drain: every stage emits its buffered/look-ahead tail. |
+| `CFG ` | `u32` stage | Open *that stage's* own modal config dialog (parented to a hidden host window), apply the result to the chain. Blocks until the user closes it. |
+| `GPRE` | `u32` stage | Get that stage's current preset. |
+| `SPRE` | `u32` stage · `str` presetBlob | Set that stage's preset (recycles the rest of the chain unchanged). |
 | `QUIT` | — | Exit the worker. |
 
 ## Worker → parent
 
 | Tag | Payload | Meaning |
 |---|---|---|
-| `LOK ` | `u32` status (1 = ok) · `str` dspName | Load succeeded. |
-| `OK  ` | — | Generic ack (e.g. after `SPRE`). |
+| `COK ` | `u32` count, then `count`×`str` dspName | Chain built (reply to `CHAN`). |
+| `LOK ` | `u32` status (1 = ok) · `str` dspName | Single-stage chain set (reply to `LOAD`). |
+| `OK  ` | — | Generic ack (reply to `RST ` / `SPRE`). |
 | `POK ` | `u32` framesOut · `f32[framesOut × channels]` | Processed audio (reply to `PROC` and `FLSH`). |
-| `PRE ` | `str` blob | A preset blob (reply to `CFG ` / `GPRE`). |
+| `PRE ` | `str` presetBlob | A stage's preset blob (reply to `CFG ` / `GPRE`). |
 | `ERR ` | `str` message | The preceding request failed (non-fatal; worker stays alive). |
 
 ## Semantics
 
-- One **persistent** `dsp` instance lives per `LOAD`/`SPRE`. `PROC` calls stream through it with state
-  preserved (foobar `dsp::run` flags = 0).
-- Look-ahead / buffering DSPs (levelers, reverbs) hold their tail until end-of-stream. Send **`FLSH`**
-  once after the last `PROC` to drain it (it runs `dsp::run` with the `FLUSH` flag). **After `FLSH` the
-  DSP is spent** — re-instantiate via `SPRE` / `CFG ` / a fresh `LOAD` before more `PROC`.
+- A chain member's component DLL is `LoadLibrary`'d **once** and its services registered into the host's
+  registry; `dsp_manager` then instantiates each stage by owner-GUID lookup against that registry. Two
+  stages of the same component are fine (each is a separate DSP instance). Re-`CHAN` rebuilds the chain.
+- `PROC` streams with the foobar `dsp::run` flag = 0 (state preserved). Look-ahead / buffering DSPs
+  (levelers, reverbs) hold their tail until end-of-stream — send **`FLSH`** once after the last `PROC` to
+  drain it (`dsp::FLUSH`). To re-process the same track (e.g. after `CFG `), send **`RST `** first so the
+  whole chain re-instantiates cleanly, then `PROC` again.
 - `POK`/`FLSH` may return a **different frame count** than was sent (resamplers, latency). A real-time
   consumer should buffer; the reference lab pre-processes the whole track then plays.
-- A worker **crash** (a misbehaving plugin) closes the pipe — detect EOF on the worker's stdout and
-  treat the slot as failed. This is the isolation guarantee; run one worker per plugin.
+- A worker **crash** (a misbehaving plugin) closes the pipe — detect EOF on the worker's stdout and treat
+  the chain as failed. This is the isolation guarantee. **Process granularity is your choice:** one worker
+  per chain (efficient — the default here) *or* one worker per DSP (max isolation), with the host splicing
+  block I/O between them. A 64-bit worker can't load 32-bit (x86) components, so a chain that mixes arches
+  needs one worker per arch with the host bridging the boundary.
 
 ## Example (pseudocode)
 
 ```
-spawn foo_dsp_host.exe --worker          # cwd must contain shared.dll
-send  LOAD "C:\...\foo_dsp_xgeq.dll" 44100 2 0
-recv  LOK 1 "Graphic Equalizer"
+spawn foo_dsp_host.exe --worker             # cwd must contain shared.dll
+send  CHAN 44100 2 3
+        "C:\...\foo_dsp_xgeq.dll"   0 ""     # stage 1 (default preset)
+        "C:\...\foo_dsp_vlevel.dll" 0 ""     # stage 2
+        "C:\...\foo_loudness_dsp.dll" 0 ""   # stage 3
+recv  COK 3 "Graphic Equalizer" "VLevel" "Loudness Compensation DSP"
 loop over the track in blocks:
   send PROC <frames> <f32 interleaved>
-  recv POK <framesOut> <f32 interleaved>
+  recv POK <framesOut> <f32 interleaved>     # streamed through all 3 stages
 send  FLSH ;  recv POK <tail>
-# optional: send CFG ; recv PRE <blob> ; SPRE <blob> ; re-run
+# tweak stage 2 live:  send CFG 1 ; recv PRE <blob> ; send RST ; re-run PROC…
 send  QUIT
 ```
 
