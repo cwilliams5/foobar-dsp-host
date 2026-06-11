@@ -33,3 +33,7 @@ out_*.wav
 
 # ref-component build outputs (host/build/ is covered above)
 /host/ref_dsp/build/
+
+# release staging (the /release skill)
+/_release_stage/
+/*.zip
