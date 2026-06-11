@@ -26,13 +26,13 @@ foreach ($plat in 'x64', 'Win32') {
   & $msbuild $hostProj /nologo /m /v:m /p:Configuration=$cfg /p:Platform=$plat /p:PlatformToolset=v143
   if ($LASTEXITCODE -ne 0) { throw "foo_dsp_host.vcxproj ($plat) build failed" }
 
-  Write-Host "=== reference component foo_dsp_ref.dll ($plat — the known-good test fixture) ==="
+  Write-Host "=== reference component foo_dsp_ref.dll ($plat - the known-good test fixture) ==="
   & $msbuild $refProj /nologo /m /v:m /p:Configuration=$cfg /p:Platform=$plat /p:PlatformToolset=v143
   if ($LASTEXITCODE -ne 0) { throw "foo_dsp_ref.vcxproj ($plat) build failed" }
 
   $exeDir = "$root\host\build\$plat\$cfg"
   # Stage the shared.dll that MATCHES this platform (x64 OutDir has a platform subdir; Win32 does not).
-  # Must be deterministic per-arch — "newest shared.dll" picks the wrong one on an incremental re-run.
+  # Must be deterministic per-arch - "newest shared.dll" picks the wrong one on an incremental re-run.
   $sdPath = if ($plat -eq 'x64') { "$root\sdk\foobar2000\shared\x64\$cfg\shared.dll" } else { "$root\sdk\foobar2000\shared\$cfg\shared.dll" }
   if (-not (Test-Path $sdPath)) { throw "shared.dll not found for ${plat}: $sdPath" }
   Copy-Item $sdPath (Join-Path $exeDir 'shared.dll') -Force
