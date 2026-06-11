@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The C++ side: both worker arches + shared.dll + the repo's own reference
+      # component (foo_dsp_ref), all from the bundled BSD foobar2000 SDK via MSBuild
+      # (preinstalled on windows-latest).
+      - name: Build workers + reference component (build.ps1)
+        shell: pwsh
+        run: .\build.ps1 Debug
+
+      - name: Build (Rust workspace — client crate + lab)
+        run: cargo build --workspace
+
+      # Unit tests + LIVE integration against the real x64 worker: handshake, recoverable
+      # errors, empty-chain passthrough, exit contracts, and bit-exact x0.5 / x0.25 gain
+      # through the repo-built foo_dsp_ref component (no third-party DLLs involved).
+      - name: Tests (incl. live worker + reference component)
+        run: cargo test -p foobar-dsp-host

@@ -429,7 +429,7 @@ pub fn stage_companion_dlls(component_dir: &Path, worker_dir: &Path) {
             .unwrap_or_default();
         let is_dll = p
             .extension()
-            .map_or(false, |x| x.eq_ignore_ascii_case("dll"));
+            .is_some_and(|x| x.eq_ignore_ascii_case("dll"));
         if is_dll && !name.to_ascii_lowercase().starts_with("foo") && !name.eq_ignore_ascii_case("shared.dll") {
             if let Some(fname) = p.file_name() {
                 let _ = std::fs::copy(&p, worker_dir.join(fname));

@@ -3,6 +3,23 @@
 The worker (`foo_dsp_host.exe --worker`) is the reusable unit. It speaks a tiny framed protocol over
 **stdin** (parent → worker) and **stdout** (worker → parent). **stderr** is human-readable diagnostics
 only — never parse it. Any language that can spawn a process and read/write its pipes can drive it.
+From Rust, the [`foobar-dsp-host`](../crates/client) crate types this whole document.
+
+**Transport:** this worker conforms to the shared transport spec —
+[`TRANSPORT.md`](https://github.com/cwilliams5/winamp-vst2-dsp-host/blob/main/docs/TRANSPORT.md) v1
+(framing, the `VERS`/`VOK ` handshake, `ERR `/`QUIT`, crash-as-EOF) — and its **`VOCAB_VERSION` is 1**.
+
+## Handshake (mandatory, first exchange)
+
+| Direction | Tag | Payload |
+|---|---|---|
+| parent → worker | `VERS` | `u32` transportVersion · `u32` vocabVersion (the parent's; currently `1`, `1`) |
+| worker → parent | `VOK ` | `u32` transportVersion · `u32` vocabVersion · `str` ident (the worker's) |
+
+`VERS` **must** be the first message; any other first tag gets `ERR ` and the worker exits with
+code **2**. The worker always answers `VOK ` with its own numbers — the **parent** enforces
+compatibility (v1 policy: exact match on both, kill on mismatch). `ident` is e.g.
+`"foo_dsp_host-worker 0.1.0 (64-bit)"`.
 
 **The worker hosts a *chain* of N ≥ 1 DSPs.** All stages are loaded into the one worker process and run in
 series, in a single pass, by the SDK's own `dsp_manager` — one host↔worker round-trip per audio block for

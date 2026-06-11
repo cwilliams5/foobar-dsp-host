@@ -10,8 +10,10 @@ hosting its DSPs outside the player has long been considered impractical. It tur
 SDK handshake, runs the plugin in an **isolated worker process**, and exposes a dead-simple stdio
 protocol that any program can drive. A Rust + egui "lab" is included as a reference client.
 
-> **Status: reference implementation.** Built for the *[Resonance](https://github.com/cwilliams5/Resonance)* media player; its long-term home and
-> source of truth will live there. See [Maintenance](#maintenance).
+> **Status: canonical home of the host.** Built for (and consumed by) the
+> *[Resonance](https://github.com/cwilliams5/Resonance)* media player — Resonance imports the
+> [`foobar-dsp-host`](crates/client) crate, so fixes land here first and circulate to everyone.
+> See [Maintenance](#maintenance).
 
 ![The lab: a foobar2000 DSP (VLevel) running in an isolated worker — its own config dialog open, live IN/OUT meters showing the effect (−26.7 → −18.6 dBFS), and instant A/B bypass.](screenshot.png)
 
@@ -45,21 +47,44 @@ protocol that any program can drive. A Rust + egui "lab" is included as a refere
 ## How it's put together
 
 ```
- your program  ── stdio protocol ──▶  foo_dsp_host.exe --worker  ── foobar2000 SDK ──▶  foo_dsp_*.dll
- (the lab, or                         (implements foobar2000_api;                       (the real
-  your own host)                       hosts the plugin; x64 or x86)                      DSP plugin)
+ your program            ── stdio protocol ──▶  foo_dsp_host.exe --worker  ── fb2k SDK ──▶  foo_dsp_*.dll
+ (the foobar-dsp-host crate:                     (implements foobar2000_api;                 (the real
+  the lab / your own host)                        hosts the chain; x64 or x86)                DSP plugins)
 ```
 
-| Path | What |
-|---|---|
-| `host/` | The C++ worker. Implements the ~11-method `foobar2000_api`, links the SDK, loads a component, and speaks the protocol on stdin/stdout. The same exe is a standalone CLI (`foo_dsp_host.exe <dll>`) and the IPC worker (`--worker`). |
-| `lab/` | The Rust/egui reference client — spawns the worker, decodes audio (symphonia), plays via cpal, with A/B, level meters, and config. |
-| `sdk/` | The vendored foobar2000 SDK (BSD-2) + one tiny ATL-removal patch so `shared.dll` builds without the VS ATL component. |
-| `docs/PROTOCOL.md` | The worker IPC protocol — the real, language-agnostic "API". |
-| `docs/HOW-IT-WORKS.md` | How the foobar2000 SDK handshake is satisfied (the interesting part). |
+### Use it from Rust — the client crate
 
-Build manually instead of the `.bat`: `./build.ps1` (workers + `shared.dll`, both arches), then
-`cargo run --manifest-path lab/Cargo.toml`.
+The **`foobar-dsp-host`** crate is the importable API: spawn the right-arch worker, build chains,
+stream f32 audio, open native config dialogs, persist `dsp_preset` blobs, survive crashes.
+
+```rust
+use foobar_dsp_host::{StageSpec, Worker};
+
+let mut w = Worker::spawn(Path::new(r"host\build\x64\Debug\foo_dsp_host.exe"))?;
+let names = w.build_chain(44100, 2, &[
+    StageSpec::new(r"C:\components\foo_dsp_xgeq.dll"),
+    StageSpec::new(r"C:\components\foo_dsp_vlevel.dll"),
+])?;
+let processed = w.process(&block)?.to_vec(); // one IPC round-trip runs the whole chain
+let tail = w.drain()?.to_vec();              // end-of-stream: look-ahead tails
+let blob = w.configure(1)?;                  // stage 1's OWN dialog (modal); persist the blob
+```
+
+A component crash surfaces as `Error::WorkerGone` — your process carries on. Arch routing
+(`dll_arch`) and companion-DLL staging (`stage_companion_dlls`) ship in the crate.
+
+| Path | Crate | What |
+|---|---|---|
+| `crates/client/` | **`foobar-dsp-host`** | **The importable API** (Rust): spawn + version handshake, chains, processing, dialogs, preset blobs, crash detection, arch routing. Built on the shared [`tagpipe`](https://github.com/cwilliams5/winamp-vst2-dsp-host) worker transport. |
+| `host/` | — | The C++ worker. Implements the ~11-method `foobar2000_api`, links the SDK, hosts the chain, and speaks the protocol on stdin/stdout. The same exe is a standalone CLI (`foo_dsp_host.exe <dll>`) and the IPC worker (`--worker`). |
+| `host/ref_dsp/` | — | `foo_dsp_ref.dll` — the repo's own known-good component (two deterministic ×0.5 gain entries), built from the bundled SDK; powers the bit-exact integration tests + CI. |
+| `lab/` | — | The Rust/egui reference client — spawns the worker via the client crate, decodes audio (symphonia), plays via cpal, with A/B, level meters, and config. |
+| `sdk/` | — | The vendored foobar2000 SDK (BSD-2) + one tiny ATL-removal patch so `shared.dll` builds without the VS ATL component. |
+| `docs/PROTOCOL.md` | | The worker IPC protocol — the language-agnostic "API" (handshake + vocabulary). |
+| `docs/HOW-IT-WORKS.md` | | How the foobar2000 SDK handshake is satisfied (the interesting part). |
+
+Build manually instead of the `.bat`: `./build.ps1` (workers + `shared.dll` + `foo_dsp_ref`, both
+arches), then `cargo run -p foobar-dsp-lab`.
 
 ## Compatibility
 
@@ -73,9 +98,12 @@ Details in `docs/HOW-IT-WORKS.md`.
 
 ## Maintenance
 
-This is a **reference implementation**; active development happens upstream in Resonance. It may be kept
-current via an automated export or may lag behind. Issues and PRs are welcome, but canonical fixes land
-upstream and flow back here.
+**This repository is the canonical home of the host** — the C++ worker, the protocol, and the
+`foobar-dsp-host` client crate live and evolve here, and
+[Resonance](https://github.com/cwilliams5/Resonance) consumes them as dependencies (so its fixes land
+here first, publicly). Maintained as used by Resonance: issues and PRs are welcome, reviewed on a
+best-effort basis, no SLA. The crate will publish to crates.io once the API has survived its first
+full downstream integration (and its `tagpipe` transport dependency is on crates.io).
 
 ## Licensing
 
