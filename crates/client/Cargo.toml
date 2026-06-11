@@ -1,0 +1,18 @@
+[package]
+name = "foobar-dsp-host"
+version = "0.1.0"
+edition = "2021"
+description = "Host real foobar2000 DSP components (foo_dsp_*) outside foobar2000: spawns the isolated worker process (x64 or x86) and drives whole DSP chains over framed stdio — stream f32 audio, open native config dialogs, persist dsp_preset blobs, survive plugin crashes."
+license = "MIT"
+repository = "https://github.com/cwilliams5/foobar-dsp-host"
+keywords = ["foobar2000", "dsp", "audio", "plugin", "host"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+# The shared worker transport (framing + VERS/VOK handshake + crash-as-EOF), from the
+# sibling winamp-vst2-dsp-host repo. Git-pinned until tagpipe publishes to crates.io
+# (a crates.io release of THIS crate requires switching to the version dep).
+tagpipe = { git = "https://github.com/cwilliams5/winamp-vst2-dsp-host", rev = "6b716d9d6816c5a5bb59697a871218d3c4b33d4d" }
+
+[lib]
+name = "foobar_dsp_host"

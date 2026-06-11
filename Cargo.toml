@@ -1,0 +1,10 @@
+# Rust side of foobar-dsp-host: the importable client crate + the egui lab (its reference
+# consumer). The C++ worker (host/) builds separately via build.ps1 (MSBuild + the bundled
+# BSD foobar2000 SDK); the crate drives the built exe over framed stdio.
+[workspace]
+resolver = "2"
+members = ["crates/client", "lab"]
+
+# Workspace-level profiles (cargo ignores member-manifest profiles).
+[profile.dev]
+opt-level = 1

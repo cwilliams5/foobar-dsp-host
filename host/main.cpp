@@ -338,6 +338,28 @@ int runWorker() {
     _setmode(_fileno(stdout), _O_BINARY);
     setvbuf(stderr, nullptr, _IONBF, 0);
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX); // no OS dialogs on a bad/crashing plugin
+
+    // --- transport handshake (TRANSPORT.md v1; mandatory first exchange) ---------------
+    // VERS must be the first message; we ALWAYS answer VOK with our versions + ident (the
+    // PARENT enforces compatibility). Any other first tag: ERR + exit 2. Done before the
+    // SDK spins up so a mismatched parent learns instantly.
+    {
+        char t[4];
+        if (!rdN(t, 4) || memcmp(t, "VERS", 4) != 0) {
+            wrErr("first message must be VERS (see TRANSPORT.md; parent predates the handshake?)");
+            return 2;
+        }
+        (void)rdU32(); // parent transport_version — the parent enforces, we just answer
+        (void)rdU32(); // parent vocab_version
+        wrTag("VOK ");
+        wrU32(1); // TRANSPORT_VERSION
+        wrU32(1); // VOCAB_VERSION (this worker's command vocabulary)
+        char ident[64];
+        sprintf_s(ident, "foo_dsp_host-worker 0.1.0 (%u-bit)", (unsigned)(sizeof(void*) * 8));
+        wrStr(ident);
+        fflush(stdout);
+    }
+
     foobar2000_client* self = foobar2000_get_interface(&hostApi, GetModuleHandleW(NULL));
     self->set_library_path("", "foo_dsp_host"); self->services_init(true);
     hostApi.registerList(service_factory_base::__internal__list);

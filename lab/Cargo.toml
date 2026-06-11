@@ -2,16 +2,19 @@
 name = "foobar-dsp-lab"
 version = "0.1.0"
 edition = "2021"
+# In-repo reference client (the client crate's first consumer) — not published.
+publish = false
 
 [[bin]]
 name = "foobar_dsp_lab"
 path = "src/main.rs"
 
 [dependencies]
+# All worker IPC goes through the flagship client crate.
+foobar-dsp-host = { path = "../crates/client" }
 cpal = "0.15"
 arc-swap = "1"
 eframe = "0.28"
 symphonia = { version = "0.5", features = ["mp3"] }
 
-[profile.dev]
-opt-level = 1
+# ([profile.dev] moved to the workspace root — cargo ignores member profiles.)

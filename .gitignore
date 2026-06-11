@@ -1,5 +1,6 @@
 # build outputs
 /host/build/
+/target/
 /lab/target/
 /_extract/
 /presets/
