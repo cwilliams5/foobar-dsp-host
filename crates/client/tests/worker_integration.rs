@@ -42,7 +42,9 @@ fn handshake_empty_chain_session() {
     assert_eq!(w.peer().vocab_version, foobar_dsp_host::VOCAB_VERSION);
 
     // A bogus component path is a RECOVERABLE error — ERR comes back, the worker lives.
-    match w.load_single(Path::new(r"C:\does\not\exist\foo_dsp_nope.dll"), 44100, 2, 0) {
+    // (Named to not look like a real foo_dsp_* component — the pregate bans third-party
+    // component references in tests.)
+    match w.load_single(Path::new(r"C:\does\not\exist\no_such_component.dll"), 44100, 2, 0) {
         Err(tagpipe::Error::Remote(msg)) => assert!(!msg.is_empty()),
         other => panic!("expected Remote error for bogus component, got {other:?}"),
     }

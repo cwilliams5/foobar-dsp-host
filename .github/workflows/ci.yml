@@ -23,6 +23,12 @@ jobs:
       - name: Build (Rust workspace — client crate + lab)
         run: cargo build --workspace
 
+      # Static checks: artifacts/ascii/wire-version-consistency (Rust const vs C++ literals
+      # vs PROTOCOL.md)/publish-metadata/tests-use-only-repo-plugins. Blocks on any failure.
+      - name: Pregate
+        shell: pwsh
+        run: ./pregate.ps1
+
       # Unit tests + LIVE integration against the real x64 worker: handshake, recoverable
       # errors, empty-chain passthrough, exit contracts, and bit-exact x0.5 / x0.25 gain
       # through the repo-built foo_dsp_ref component (no third-party DLLs involved).
