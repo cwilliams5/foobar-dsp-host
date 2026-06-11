@@ -17,10 +17,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0build.ps1" Debug || go
 
 echo [2/3] Extracting components + building the lab...
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0extract-components.ps1" || goto err
-cargo build --manifest-path "%~dp0lab\Cargo.toml" || goto err
+cargo build -p foobar-dsp-lab || goto err
 
 echo [3/3] Launching the lab...
-"%~dp0lab\target\x86_64-pc-windows-msvc\debug\foobar_dsp_lab.exe"
+"%~dp0target\debug\foobar_dsp_lab.exe"
 goto :eof
 
 :err
