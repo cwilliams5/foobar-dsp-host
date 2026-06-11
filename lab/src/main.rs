@@ -12,10 +12,9 @@
 
 use arc_swap::ArcSwap;
 use eframe::egui;
+use foobar_dsp_host::{dll_arch, stage_companion_dlls, PeArch, StageSpec};
 use std::error::Error;
-use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -31,65 +30,46 @@ fn proto_root() -> PathBuf { Path::new(ROOT).parent().unwrap().to_path_buf() }
 fn fname(p: &Path) -> String { p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default() }
 
 // ----------------------------- worker IPC client -----------------------------
-// The worker hosts a CHAIN of N>=1 DSPs. We build it with CHAN, stream blocks through the whole chain
-// with PROC, drain look-ahead tails with FLSH, re-instantiate fresh with RST, and open a stage's own
-// config dialog with CFG <stage>. See docs/PROTOCOL.md.
-struct Worker { child: Child, w: BufWriter<std::process::ChildStdin>, r: BufReader<std::process::ChildStdout> }
+// All worker IPC goes through the foobar-dsp-host client crate (this lab is its first
+// consumer). These thin wrappers keep the engine's historical String-error call shapes.
+// The worker hosts a CHAIN of N>=1 DSPs: CHAN builds it, PROC streams blocks through the
+// whole chain, FLSH drains look-ahead tails, RST re-instantiates fresh, CFG <stage> opens
+// a stage's own config dialog. See docs/PROTOCOL.md.
+struct Worker(foobar_dsp_host::Worker);
 impl Worker {
     fn spawn(exe: &Path, workdir: &Path) -> std::io::Result<Worker> {
-        let mut child = Command::new(exe).arg("--worker").current_dir(workdir)
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()?;
-        let w = BufWriter::new(child.stdin.take().unwrap());
-        let r = BufReader::new(child.stdout.take().unwrap());
-        Ok(Worker { child, w, r })
-    }
-    fn tag(&mut self, t: &[u8; 4]) -> std::io::Result<()> { self.w.write_all(t) }
-    fn u32(&mut self, v: u32) -> std::io::Result<()> { self.w.write_all(&v.to_le_bytes()) }
-    fn bytes(&mut self, b: &[u8]) -> std::io::Result<()> { self.w.write_all(b) }
-    fn str(&mut self, s: &str) -> std::io::Result<()> { self.u32(s.len() as u32)?; self.bytes(s.as_bytes()) }
-    fn flush(&mut self) -> std::io::Result<()> { self.w.flush() }
-    fn rd_tag(&mut self) -> std::io::Result<[u8; 4]> { let mut t = [0u8; 4]; self.r.read_exact(&mut t)?; Ok(t) }
-    fn rd_u32(&mut self) -> std::io::Result<u32> { let mut b = [0u8; 4]; self.r.read_exact(&mut b)?; Ok(u32::from_le_bytes(b)) }
-    fn rd_bytes(&mut self, n: usize) -> std::io::Result<Vec<u8>> { let mut v = vec![0u8; n]; self.r.read_exact(&mut v)?; Ok(v) }
-    fn rd_str(&mut self) -> std::io::Result<String> { let n = self.rd_u32()? as usize; Ok(String::from_utf8_lossy(&self.rd_bytes(n)?).into_owned()) }
-    fn read_pcm(&mut self, nch: usize) -> Result<Vec<f32>, String> {
-        let nf = self.rd_u32().map_err(|e| e.to_string())? as usize;
-        let bytes = self.rd_bytes(nf * nch * 4).map_err(|e| e.to_string())?;
-        Ok(bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+        foobar_dsp_host::Worker::spawn_with(
+            exe,
+            &foobar_dsp_host::SpawnOptions { working_dir: Some(workdir.to_path_buf()), ..Default::default() },
+        )
+        .map(Worker)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
     }
     // Build an N-stage chain in one message: each stage = (component dll, optional preset blob; empty = default).
     fn chain(&mut self, stages: &[(String, Vec<u8>)], sr: u32, nch: u32) -> Result<Vec<String>, String> {
-        self.tag(b"CHAN").and_then(|_| self.u32(sr)).and_then(|_| self.u32(nch)).and_then(|_| self.u32(stages.len() as u32)).map_err(|e| e.to_string())?;
-        for (dll, blob) in stages {
-            self.str(dll).and_then(|_| self.u32(0)).and_then(|_| self.u32(blob.len() as u32)).and_then(|_| self.bytes(blob)).map_err(|e| e.to_string())?;
-        }
-        self.flush().map_err(|e| e.to_string())?;
-        match &self.rd_tag().map_err(|e| e.to_string())? {
-            b"COK " => { let n = self.rd_u32().map_err(|e| e.to_string())? as usize; let mut v = Vec::with_capacity(n); for _ in 0..n { v.push(self.rd_str().map_err(|e| e.to_string())?); } Ok(v) }
-            b"ERR " => Err(self.rd_str().unwrap_or_default()),
-            o => Err(format!("unexpected {:?}", o)),
-        }
+        let specs: Vec<StageSpec> = stages
+            .iter()
+            .map(|(dll, blob)| StageSpec { dll: dll.into(), entry_index: 0, preset: blob.clone() })
+            .collect();
+        self.0.build_chain(sr, nch, &specs).map_err(|e| e.to_string())
     }
     fn reset(&mut self) -> Result<(), String> { // drop instantiated DSPs; next PROC re-instantiates the chain fresh
-        self.tag(b"RST ").and_then(|_| self.flush()).map_err(|e| e.to_string())?;
-        match &self.rd_tag().map_err(|e| e.to_string())? { b"OK  " => Ok(()), b"ERR " => Err(self.rd_str().unwrap_or_default()), o => Err(format!("unexpected {:?}", o)) }
+        self.0.reset().map_err(|e| e.to_string())
     }
-    fn process(&mut self, block: &[f32], frames: u32, nch: usize) -> Result<Vec<f32>, String> {
-        self.tag(b"PROC").and_then(|_| self.u32(frames)).map_err(|e| e.to_string())?;
-        let mut raw = Vec::with_capacity(block.len() * 4);
-        for s in block { raw.extend_from_slice(&s.to_le_bytes()); }
-        self.bytes(&raw).and_then(|_| self.flush()).map_err(|e| e.to_string())?;
-        match &self.rd_tag().map_err(|e| e.to_string())? { b"POK " => self.read_pcm(nch), b"ERR " => Err(self.rd_str().unwrap_or_default()), o => Err(format!("unexpected {:?}", o)) }
+    fn process(&mut self, block: &[f32], _frames: u32, _nch: usize) -> Result<Vec<f32>, String> {
+        let mut out = Vec::new();
+        self.0.process_into(block, &mut out).map_err(|e| e.to_string())?;
+        Ok(out)
     }
-    fn drain(&mut self, nch: usize) -> Result<Vec<f32>, String> {
-        self.tag(b"FLSH").and_then(|_| self.flush()).map_err(|e| e.to_string())?;
-        match &self.rd_tag().map_err(|e| e.to_string())? { b"POK " => self.read_pcm(nch), b"ERR " => Err(self.rd_str().unwrap_or_default()), o => Err(format!("unexpected {:?}", o)) }
+    fn drain(&mut self, _nch: usize) -> Result<Vec<f32>, String> {
+        let mut out = Vec::new();
+        self.0.drain_into(&mut out).map_err(|e| e.to_string())?;
+        Ok(out)
     }
     fn config(&mut self, stage: u32) -> Result<Vec<u8>, String> {
-        self.tag(b"CFG ").and_then(|_| self.u32(stage)).and_then(|_| self.flush()).map_err(|e| e.to_string())?;
-        match &self.rd_tag().map_err(|e| e.to_string())? { b"PRE " => { let n = self.rd_u32().map_err(|e| e.to_string())? as usize; self.rd_bytes(n).map_err(|e| e.to_string()) } b"ERR " => Err(self.rd_str().unwrap_or_default()), o => Err(format!("unexpected {:?}", o)) }
+        self.0.configure(stage).map_err(|e| e.to_string())
     }
-    fn quit(&mut self) { let _ = self.tag(b"QUIT"); let _ = self.flush(); let _ = self.child.wait(); }
+    fn quit(self) { let _ = self.0.quit(); }
 }
 
 // ----------------------------- WAV + DSP helpers -----------------------------
@@ -161,7 +141,7 @@ fn engine_thread(rx: Receiver<EngineMsg>, shared: Arc<Shared>, status: Arc<Mutex
     while let Ok(msg) = rx.recv() {
         match msg {
             EngineMsg::SetChain(dlls) => {
-                if let Some(mut w) = worker.take() { w.quit(); }
+                if let Some(w) = worker.take() { w.quit(); }
                 cur_chain.clear();
                 shared.proc_ready.store(false, Relaxed);
                 shared.bypass.store(true, Relaxed);
@@ -173,11 +153,11 @@ fn engine_thread(rx: Receiver<EngineMsg>, shared: Arc<Shared>, status: Arc<Mutex
                 if let Some(bad) = dlls.iter().find(|d| dll_arch(d) != arch) {
                     set(format!("chain mixes x86 + x64 ({} differs) — the worker & protocol support it, but cross-arch needs one worker per arch with blocks routed between them; this demo keeps a chain single-arch (that router is the host app's job — see docs/PROTOCOL.md)", fname(bad))); continue;
                 }
-                let is_x86 = arch == 0x14C;
+                let is_x86 = arch == PeArch::X86;
                 let worker_exe = if is_x86 { &worker_x86 } else { &worker_x64 };
                 if !worker_exe.exists() { set(format!("the {} worker isn't built — build.ps1 builds both", if is_x86 { "x86" } else { "x64" })); continue; }
                 let worker_dir = worker_exe.parent().unwrap();
-                for d in &dlls { stage_companions(d.parent().unwrap_or(worker_dir), worker_dir); }
+                for d in &dlls { stage_companion_dlls(d.parent().unwrap_or(worker_dir), worker_dir); }
                 set(format!("building chain of {} ({}) …", dlls.len(), if is_x86 { "x86" } else { "x64" }));
                 let mut w = match Worker::spawn(worker_exe, worker_dir) { Ok(w) => w, Err(e) => { set(format!("worker spawn failed: {e}")); continue; } };
                 let stages: Vec<(String, Vec<u8>)> = dlls.iter().map(|d| (d.to_string_lossy().into_owned(), load_persisted(d))).collect();
@@ -218,7 +198,7 @@ fn engine_thread(rx: Receiver<EngineMsg>, shared: Arc<Shared>, status: Arc<Mutex
                     }
                 } else { set("apply a chain first".into()); }
             }
-            EngineMsg::Quit => { if let Some(mut w) = worker.take() { w.quit(); } break; }
+            EngineMsg::Quit => { if let Some(w) = worker.take() { w.quit(); } break; }
         }
     }
 }
@@ -335,29 +315,8 @@ fn resample_stereo(src: &[f32], from: u32, to: u32) -> Vec<f32> {
     out
 }
 
-// Copy companion DLLs (e.g. soxr64.dll) next to the worker so loaded components resolve them.
-fn stage_companions(src_dir: &Path, worker_dir: &Path) {
-    if let Ok(rd) = std::fs::read_dir(src_dir) {
-        for e in rd.flatten() {
-            let p = e.path();
-            let nm = fname(&p);
-            if p.extension().map_or(false, |x| x == "dll") && !nm.starts_with("foo") && !nm.eq_ignore_ascii_case("shared.dll") {
-                let _ = std::fs::copy(&p, worker_dir.join(p.file_name().unwrap()));
-            }
-        }
-    }
-}
-
-// Read a DLL's PE machine type: 0x8664 = x64, 0x14C = x86 (0 on error / not a PE).
-fn dll_arch(p: &Path) -> u16 {
-    let mut f = match std::fs::File::open(p) { Ok(f) => f, Err(_) => return 0 };
-    let mut b = [0u8; 1024];
-    let n = f.read(&mut b).unwrap_or(0);
-    if n < 0x40 || &b[0..2] != b"MZ" { return 0; }
-    let e = u32::from_le_bytes([b[0x3C], b[0x3D], b[0x3E], b[0x3F]]) as usize;
-    if e + 6 > n || &b[e..e + 4] != b"PE\0\0" { return 0; }
-    u16::from_le_bytes([b[e + 4], b[e + 5]])
-}
+// (Companion-DLL staging + PE-arch probing moved into the foobar-dsp-host crate:
+// stage_companion_dlls / dll_arch / PeArch.)
 
 // ----------------------------- minimal PNG writer (no deps) -----------------------------
 // Writes RGB8 as a PNG using a zlib "stored" (uncompressed) stream — enough to save a screenshot of the
@@ -579,13 +538,13 @@ impl eframe::App for LabApp {
 // the full chain differs from the raw input), 1 otherwise. No display / no audio device required.
 fn run_selftest(worker_x64: &Path, comps: &[PathBuf], raw: &[f32], sr: u32) -> i32 {
     // Prefer a few components that visibly do something at default; else just take the first available.
-    let pick = |needle: &str| comps.iter().find(|p| fname(p).to_lowercase().contains(needle) && dll_arch(p) == 0x8664).cloned();
+    let pick = |needle: &str| comps.iter().find(|p| fname(p).to_lowercase().contains(needle) && dll_arch(p) == PeArch::X64).cloned();
     let mut chosen: Vec<PathBuf> = ["delta", "vlevel", "loudness"].iter().filter_map(|n| pick(n)).collect();
-    if chosen.len() < 2 { chosen = comps.iter().filter(|p| dll_arch(p) == 0x8664).take(3).cloned().collect(); }
+    if chosen.len() < 2 { chosen = comps.iter().filter(|p| dll_arch(p) == PeArch::X64).take(3).cloned().collect(); }
     if chosen.is_empty() { eprintln!("SELFTEST: no x64 components found"); return 1; }
     if !worker_x64.exists() { eprintln!("SELFTEST: x64 worker not built ({})", worker_x64.display()); return 1; }
     let worker_dir = worker_x64.parent().unwrap();
-    for d in &chosen { stage_companions(d.parent().unwrap_or(worker_dir), worker_dir); }
+    for d in &chosen { stage_companion_dlls(d.parent().unwrap_or(worker_dir), worker_dir); }
     let mut w = match Worker::spawn(worker_x64, worker_dir) { Ok(w) => w, Err(e) => { eprintln!("SELFTEST: spawn failed: {e}"); return 1; } };
 
     println!("SELFTEST: cumulative RMS dBFS as each stage is added (raw {:.2}):", rms_db(raw));
