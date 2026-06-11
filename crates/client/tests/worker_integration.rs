@@ -67,6 +67,80 @@ fn handshake_empty_chain_session() {
     assert!(status.success(), "worker exit: {status:?}");
 }
 
+/// Audio through a REAL component: the repo's own foo_dsp_ref (a deterministic ×0.5
+/// gain — exactly representable in f32, so the assertion is bit-exact). Proves
+/// component loading, chain building, preset round-trip shape, and processing — with
+/// zero third-party DLLs (CI builds the fixture from the bundled BSD SDK).
+#[test]
+fn ref_component_chain_applies_exact_gain() {
+    let exe = require_worker!();
+    let ref_dll = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(r"..\..\host\ref_dsp\build\x64\Debug\foo_dsp_ref.dll");
+    if !ref_dll.is_file() {
+        eprintln!("skip: foo_dsp_ref not built (run build.ps1)");
+        return;
+    }
+
+    let mut w = Worker::spawn(&exe).expect("spawn + handshake");
+    // (Entry enumeration order is an SDK registration detail — both ref entries are a
+    // ×0.5 gain, so every audio assertion below is order-independent.)
+    let names = w
+        .build_chain(44100, 2, &[foobar_dsp_host::StageSpec::new(&ref_dll)])
+        .expect("CHAN ref");
+    assert_eq!(names.len(), 1);
+    assert!(names[0].starts_with("Reference Gain"), "name: {}", names[0]);
+
+    let block: Vec<f32> = (0..4096 * 2).map(|i| ((i as f32) * 0.007).sin() * 0.8).collect();
+    let out = w.process(&block).expect("PROC").to_vec();
+    let expected: Vec<f32> = block.iter().map(|&s| s * 0.5).collect();
+    assert_eq!(out, expected, "x0.5 gain must be bit-exact");
+    let tail = w.drain().expect("FLSH");
+    assert!(tail.is_empty(), "gain DSP has no look-ahead tail");
+
+    // Re-CHAN on a live worker requires RST before the next PROC (dsp_manager
+    // re-instantiates lazily; the lab always resets before re-processing — see
+    // PROTOCOL.md). Two DISTINCT stages (the component's two entries) compound to x0.25.
+    let names = w
+        .build_chain(
+            44100,
+            2,
+            &[
+                foobar_dsp_host::StageSpec::new(&ref_dll),
+                foobar_dsp_host::StageSpec { entry_index: 1, ..foobar_dsp_host::StageSpec::new(&ref_dll) },
+            ],
+        )
+        .expect("CHAN ref A+B");
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(sorted, vec!["Reference Gain (x0.5)", "Reference Gain B (x0.5)"]);
+    w.reset().expect("RST after re-CHAN");
+    let out = w.process(&block).expect("PROC A+B").to_vec();
+    let expected: Vec<f32> = block.iter().map(|&s| s * 0.25).collect();
+    assert_eq!(out, expected, "two distinct stages must compound to x0.25");
+
+    // Two copies of the SAME entry also compound (after RST).
+    w.build_chain(
+        44100,
+        2,
+        &[
+            foobar_dsp_host::StageSpec::new(&ref_dll),
+            foobar_dsp_host::StageSpec::new(&ref_dll),
+        ],
+    )
+    .expect("CHAN ref x2");
+    w.reset().expect("RST after re-CHAN x2");
+    let out = w.process(&block).expect("PROC x2").to_vec();
+    assert_eq!(out, expected, "two identical stages must also compound to x0.25");
+
+    // The preset mechanism round-trips (the ref DSP's preset is owner-GUID + empty data).
+    let blob = w.get_preset(0).expect("GPRE");
+    assert_eq!(blob.len(), 16, "GUID16 + empty data");
+    w.set_preset(0, &blob).expect("SPRE");
+
+    let status = w.quit().expect("quit");
+    assert!(status.success(), "worker exit: {status:?}");
+}
+
 #[test]
 fn non_vers_first_message_gets_err_and_exit_2() {
     let exe = require_worker!();

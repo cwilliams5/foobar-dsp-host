@@ -15,6 +15,7 @@ if (-not $msbuild -or -not (Test-Path $msbuild)) { throw "MSBuild not found. Ins
 
 $sharedProj = "$root\sdk\foobar2000\shared\shared.vcxproj"
 $hostProj   = "$root\host\foo_dsp_host.vcxproj"
+$refProj    = "$root\host\ref_dsp\foo_dsp_ref.vcxproj"
 
 foreach ($plat in 'x64', 'Win32') {
   Write-Host "`n=== shared.dll ($plat, from BSD SDK source) ==="
@@ -24,6 +25,10 @@ foreach ($plat in 'x64', 'Win32') {
   Write-Host "=== worker foo_dsp_host.exe ($plat) ==="
   & $msbuild $hostProj /nologo /m /v:m /p:Configuration=$cfg /p:Platform=$plat /p:PlatformToolset=v143
   if ($LASTEXITCODE -ne 0) { throw "foo_dsp_host.vcxproj ($plat) build failed" }
+
+  Write-Host "=== reference component foo_dsp_ref.dll ($plat — the known-good test fixture) ==="
+  & $msbuild $refProj /nologo /m /v:m /p:Configuration=$cfg /p:Platform=$plat /p:PlatformToolset=v143
+  if ($LASTEXITCODE -ne 0) { throw "foo_dsp_ref.vcxproj ($plat) build failed" }
 
   $exeDir = "$root\host\build\$plat\$cfg"
   # Stage the shared.dll that MATCHES this platform (x64 OutDir has a platform subdir; Win32 does not).

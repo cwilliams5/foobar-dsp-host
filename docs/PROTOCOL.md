@@ -50,7 +50,11 @@ read one), except the modal `CFG ` (see below).
 
 - A chain member's component DLL is `LoadLibrary`'d **once** and its services registered into the host's
   registry; `dsp_manager` then instantiates each stage by owner-GUID lookup against that registry. Two
-  stages of the same component are fine (each is a separate DSP instance). Re-`CHAN` rebuilds the chain.
+  stages of the same component are fine (each is a separate DSP instance). Re-`CHAN` replaces the chain
+  config — but on a worker that has already processed audio, **send `RST ` after a re-`CHAN`, before the
+  next `PROC`**: `dsp_manager` reconciles instances lazily and the previous chain keeps running until the
+  reset re-instantiates the new one (empirically verified; the reference lab always RSTs before
+  re-processing).
 - `PROC` streams with the foobar `dsp::run` flag = 0 (state preserved). Look-ahead / buffering DSPs
   (levelers, reverbs) hold their tail until end-of-stream — send **`FLSH`** once after the last `PROC` to
   drain it (`dsp::FLUSH`). To re-process the same track (e.g. after `CFG `), send **`RST `** first so the
