@@ -316,7 +316,12 @@ impl Worker {
     /// persist it and hand it back via [`StageSpec::preset`] / [`Worker::set_preset`].
     ///
     /// **Blocks until the user closes the dialog** (foobar2000 DSP config popups are
-    /// modal). Audio you wanted processed meanwhile waits with it.
+    /// modal *inside the worker* — the worker is frozen for the dialog's lifetime, so no
+    /// other request can be serviced meanwhile). To **cancel** an open dialog from another
+    /// thread — e.g. the user removed the plugin or rebuilt the chain — call
+    /// [`Worker::killer`]`().kill()`: terminating the worker is the only way to dismiss a
+    /// modal popup from out-of-process, and this call then returns [`Error::WorkerGone`].
+    /// (The reference lab does exactly this; build a fresh worker for the new chain.)
     pub fn configure(&mut self, stage: u32) -> Result<Vec<u8>> {
         let w = &mut self.proc_.stdin;
         frame::write_tag(w, tags::CFG)?;

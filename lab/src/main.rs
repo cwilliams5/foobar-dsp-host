@@ -69,6 +69,8 @@ impl Worker {
     fn config(&mut self, stage: u32) -> Result<Vec<u8>, String> {
         self.0.configure(stage).map_err(|e| e.to_string())
     }
+    // A detached kill handle — used to dismiss a modal config dialog by terminating the worker.
+    fn killer(&self) -> std::io::Result<foobar_dsp_host::tagpipe::WorkerKiller> { self.0.killer() }
     fn quit(self) { let _ = self.0.quit(); }
 }
 
@@ -133,7 +135,9 @@ struct Shared {
 // owns the worker + per-stage presets (persisted to presets/, keyed by component).
 enum EngineMsg { SetChain(Vec<PathBuf>), ConfigStage(usize), Quit }
 
-fn engine_thread(rx: Receiver<EngineMsg>, shared: Arc<Shared>, status: Arc<Mutex<String>>, worker_x64: PathBuf, worker_x86: PathBuf) {
+type CfgKiller = Arc<Mutex<Option<foobar_dsp_host::tagpipe::WorkerKiller>>>;
+
+fn engine_thread(rx: Receiver<EngineMsg>, shared: Arc<Shared>, status: Arc<Mutex<String>>, worker_x64: PathBuf, worker_x86: PathBuf, cfg_killer: CfgKiller) {
     let sr = shared.sr.load(Relaxed);
     let set = |s: String| *status.lock().unwrap() = s;
     let mut worker: Option<Worker> = None;
@@ -182,11 +186,22 @@ fn engine_thread(rx: Receiver<EngineMsg>, shared: Arc<Shared>, status: Arc<Mutex
                 }
             }
             EngineMsg::ConfigStage(i) => {
+                let mut rebuild_needed = false;
                 if let Some(w) = worker.as_mut() {
                     if i >= cur_chain.len() { set("stage no longer in the chain — Apply first".into()); continue; }
                     set(format!("opening stage {}’s config dialog — adjust + OK …", i + 1));
-                    match w.config(i as u32) {
-                        Ok(blob) => {
+                    // foobar config dialogs are MODAL in the worker (it blocks inside
+                    // show_config_popup). Publish a kill handle so a rack edit / Apply can
+                    // dismiss the dialog by terminating the worker -- the only way to close a
+                    // modal popup from out-of-process (SetChain respawns one anyway).
+                    if let Ok(k) = w.killer() {
+                        *cfg_killer.lock().unwrap() = Some(k);
+                    }
+                    let cfg_res = w.config(i as u32);
+                    // The UI takes the handle when it kills to cancel; gone => cancelled.
+                    let cancelled = cfg_killer.lock().unwrap().take().is_none();
+                    match cfg_res {
+                        Ok(blob) if !cancelled => {
                             save_persisted(&cur_chain[i], &blob); // remember this component's settings across runs
                             let raw = shared.raw.load_full();
                             match preprocess(w, &raw) {
@@ -194,9 +209,20 @@ fn engine_thread(rx: Receiver<EngineMsg>, shared: Arc<Shared>, status: Arc<Mutex
                                 Err(e) => set(format!("reprocess failed: {e}")),
                             }
                         }
-                        Err(e) => set(format!("config failed: {e}")),
+                        Ok(_) => { set("config cancelled (chain changed) — Apply to rebuild".into()); rebuild_needed = true; } // raced: cancelled after CFG returned OK
+                        Err(_) if cancelled => { set("config cancelled (chain changed) — Apply to rebuild".into()); rebuild_needed = true; }
+                        Err(e) => { set(format!("config failed: {e}")); rebuild_needed = true; }
                     }
                 } else { set("apply a chain first".into()); }
+                // A cancelled/failed config leaves the worker dead or suspect: drop it so the
+                // queued SetChain (or the next Apply) rebuilds cleanly instead of reusing it.
+                // (The status was already set by the match — cancelled vs failed.)
+                if rebuild_needed {
+                    if let Some(w) = worker.take() { let _ = w.quit(); }
+                    cur_chain.clear();
+                    shared.proc_ready.store(false, Relaxed);
+                    shared.bypass.store(true, Relaxed);
+                }
             }
             EngineMsg::Quit => { if let Some(w) = worker.take() { w.quit(); } break; }
         }
@@ -381,12 +407,13 @@ struct LabApp {
     shot_path: Option<PathBuf>,    // --shot: capture the rack to this PNG then exit
     shot_phase: u8,
     shot_frames: u32,
+    cfg_killer: CfgKiller,         // kill handle for an open modal config (shared with the engine)
 }
 impl LabApp {
-    fn new(shared: Arc<Shared>, status: Arc<Mutex<String>>, tx: Sender<EngineMsg>, comps: Vec<PathBuf>, shot_path: Option<PathBuf>) -> Self {
+    fn new(shared: Arc<Shared>, status: Arc<Mutex<String>>, tx: Sender<EngineMsg>, comps: Vec<PathBuf>, shot_path: Option<PathBuf>, cfg_killer: CfgKiller) -> Self {
         let names = comps.iter().map(|p| fname(p)).collect();
         let (stream, stream_err) = match build_stream(shared.clone()) { Ok(s) => (Some(s), None), Err(e) => (None, Some(e)) };
-        let mut app = LabApp { shared, status, tx, comps, names, selected: 0, chain: Vec::new(), dirty: false, stream_err, _stream: stream, shot_path: shot_path.clone(), shot_phase: 0, shot_frames: 0 };
+        let mut app = LabApp { shared, status, tx, comps, names, selected: 0, chain: Vec::new(), dirty: false, stream_err, _stream: stream, shot_path: shot_path.clone(), shot_phase: 0, shot_frames: 0, cfg_killer };
         if shot_path.is_some() {
             // build a default chain for the screenshot (Noise Sharpening → VLevel → Loudness, if present)
             for needle in ["delta", "vlevel", "loudness"] {
@@ -398,8 +425,15 @@ impl LabApp {
         app
     }
     fn apply_chain(&mut self) {
+        self.cancel_open_config(); // dismiss any open modal dialog so the engine can rebuild
         let _ = self.tx.send(EngineMsg::SetChain(self.chain.iter().map(|(p, _)| p.clone()).collect()));
         self.dirty = false;
+    }
+    // Kill the worker hosting an open modal config dialog (if any): closes the dialog and
+    // unblocks the engine thread to process the queued rebuild. foobar configs are modal in
+    // the worker, so terminating the process is the only way to dismiss one from here.
+    fn cancel_open_config(&self) {
+        if let Some(k) = self.cfg_killer.lock().unwrap().take() { let _ = k.kill(); }
     }
 }
 fn meter(ui: &mut egui::Ui, label: &str, db: f32) {
@@ -469,6 +503,9 @@ impl eframe::App for LabApp {
             if let Some(i) = to_remove { self.chain.remove(i); self.dirty = true; }
             if let Some(i) = to_up { self.chain.swap(i, i - 1); self.dirty = true; }
             if let Some(i) = to_down { self.chain.swap(i, i + 1); self.dirty = true; }
+            // A rack edit invalidates the applied chain — and any modal config dialog open on
+            // it. Dismiss that dialog now (close its worker) so it can't outlive its plugin.
+            if to_remove.is_some() || to_up.is_some() || to_down.is_some() { self.cancel_open_config(); }
             if let Some(i) = to_cfg { let _ = self.tx.send(EngineMsg::ConfigStage(i)); }
 
             ui.add_space(4.0);
@@ -608,13 +645,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
     let status = Arc::new(Mutex::new(String::from("pick a DSP, Add it, build a chain, then Apply")));
     let (tx, rx) = mpsc::channel();
-    let engine = { let s = shared.clone(); let st = status.clone(); let (wx64, wx86) = (worker_x64.clone(), worker_x86.clone()); std::thread::spawn(move || engine_thread(rx, s, st, wx64, wx86)) };
+    let cfg_killer: CfgKiller = Arc::new(Mutex::new(None));
+    let engine = { let s = shared.clone(); let st = status.clone(); let (wx64, wx86) = (worker_x64.clone(), worker_x86.clone()); let ck = cfg_killer.clone(); std::thread::spawn(move || engine_thread(rx, s, st, wx64, wx86, ck)) };
 
     let tx_quit = tx.clone();
     let opts = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_inner_size([600.0, 560.0]).with_title("Resonance foobar2000 DSP Lab"), ..Default::default() };
     let app_shared = shared.clone();
     let shot = shot_path.clone();
-    eframe::run_native("Resonance foobar2000 DSP Lab", opts, Box::new(move |_cc| Ok(Box::new(LabApp::new(app_shared, status, tx, comps, shot)))))
+    eframe::run_native("Resonance foobar2000 DSP Lab", opts, Box::new(move |_cc| Ok(Box::new(LabApp::new(app_shared, status, tx, comps, shot, cfg_killer)))))
         .map_err(|e| format!("eframe: {e}"))?;
 
     let _ = tx_quit.send(EngineMsg::Quit);
